@@ -77,10 +77,10 @@
 
 需要 Docker 20.10+（支持 Compose v2）。在工作目录准备好 `.env`（可从
 `.env.example` 复制；只需 `/plan`、`/assemble` 等无鉴权端点时也可留空），
-再用**单条命令**构建并后台启动：
+再用**单条命令**构建并启动：
 
 ```
-docker compose up --build -d
+docker compose up --build
 ```
 
 - 访问地址：http://127.0.0.1:8080 （服务监听容器内 8080 端口，Compose
@@ -93,14 +93,8 @@ docker compose up --build -d
 `SECURE_REQUEST_NONCE_CAPACITY` 均由 Compose 从同目录 `.env` 读取（默认值
 见下节“配置”），无需修改 `docker-compose.yml`。
 
-查看日志与停止：
-
-```
-docker compose logs -f
-docker compose down
-```
-
-不带 `-d` 可在前台运行。
+上述命令在前台运行并输出日志，`Ctrl+C` 停止；追加 `-d` 可后台启动，
+此后可用 `docker compose logs -f` 查看日志、`docker compose down` 停止。
 
 不使用 Compose 时也可以直接用 Docker：
 
@@ -777,10 +771,12 @@ envelope["signature"] = hmac.new(
 
 只有**执行成功（HTTP 200）**的请求才会占用 nonce；验签通过但 payload
 非法或业务校验失败的请求会回滚 nonce 占位，客户端修正后可用同一 nonce
-重试。回滚只删除请求自己的占位：若该占位恰好已过期并被并发请求重新占用，
-原有记录不会被误删。到期索引中的每条条目同样携带占位令牌：占位被释放
-或同名 nonce 到期后被重新占用时，遗留的索引条目在弹出时会因与主表记录
-不符而被直接丢弃，不会误删新占位。重放已成功的 nonce 返回 `409`。
+重试。回滚只删除请求自己的占位：主表记录与对应的到期索引条目一并移除
+（索引条目以占位令牌逐字定位），失效索引立即回收，索引规模始终不超过
+主表、不随失败请求次数增长；若该占位恰好已过期并被并发请求重新占用，
+原有记录不会被误删。到期索引中的每条条目同样携带占位令牌：同名 nonce
+到期后被重新占用时，遗留的索引条目在弹出时会因与主表记录不符而被直接
+丢弃，不会误删新占位。重放已成功的 nonce 返回 `409`。
 
 ### `POST /safe-download-name`
 
@@ -1047,7 +1043,7 @@ curl -s -X POST http://127.0.0.1:8080/client-range-decision \
 在做 Range 决策之前先评估 GET 前置条件（RFC 9110 §13.2），决定直接回
 `304 Not Modified` 还是继续正常的 `200`/`206`/`416` 决策。不需要任何环境变量
 配置，服务地址同为 `http://127.0.0.1:8080`（Docker Compose 单命令启动：
-`docker compose up --build -d`，默认只绑定本机回环地址）。
+`docker compose up --build`，默认只绑定本机回环地址）。
 
 请求字段包含 `/client-range-decision` 的全部字段（`object_length`、`etag`、
 `last_modified`、`range_header`、`if_range`、`max_gap`、`fetch_limit`、
@@ -1297,7 +1293,7 @@ python examples/cache_write_decision_example.py
 强 ETag 与请求头按写入侧完全相同的键算法逐块重算缓存键，筛出仍然可用的
 缓存块，并直接得到可用于 [`/assemble`](#post-assemble) 的回源规划。本端点
 不需要任何环境变量配置，服务地址同为 `http://127.0.0.1:8080`（Docker
-Compose 单命令启动：`docker compose up --build -d`，容器内固定监听 8080，
+Compose 单命令启动：`docker compose up --build`，容器内固定监听 8080，
 默认只绑定本机回环地址）。
 
 请求字段：
