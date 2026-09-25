@@ -39,10 +39,11 @@ HMAC-SHA256 密钥验签，限制时间偏差，并对 key_id+nonce 做窗口内
 同一把锁内先按到期时间索引清理已到期项（只从索引头部弹出到期条目，
 不扫描未过期 nonce）、再识别重放、最后为新 nonce 预留名额；容量已满
 且无过期项时返回 503 nonce_capacity_exceeded，绝不驱逐未过期 nonce。
-索引条目携带占位令牌，与主表记录逐字一致才生效：失败请求释放占位或
-同名 nonce 到期后被重新占用时，遗留的索引条目会被直接丢弃，不会误删
-新占位。验签通过后执行对应操作并原样返回其响应；/plan 与 /assemble
-本身不受影响。
+到期索引与主表同步维护：失败请求释放占位时连同其索引条目一并删除，
+失效索引立即回收，索引规模不随失败次数增长；到期清理弹出的索引条目
+携带占位令牌，与主表记录逐字一致才生效，不一致的遗留条目（同名
+nonce 已被重新占用等）直接丢弃，不会误删新占位。验签通过后执行对应
+操作并原样返回其响应；/plan 与 /assemble 本身不受影响。
 
 POST /multipart-parse 解析上游返回的 multipart/byteranges 完整响应体
 （Base64 传输）：请求提供对象总长度、期望的 interval/suffix ranges 与
@@ -198,11 +199,12 @@ _nonce_lock = threading.Lock()
 _nonce_seen: dict[tuple[str, str], tuple[float, int]] = {}
 
 # 按到期时间推进的索引：(到期时间戳, 占位令牌, nonce_key) 构成的最小堆，
-# 与主表同步写入。清理时只从堆顶取出已到期条目，单次预留无需扫描全部
-# 未过期 nonce。索引条目同样携带占位令牌：弹出时与主表记录逐字核对，
-# 一致才删除主表项；占位已释放或同名 nonce 到期后被重新占用时，弹出的
-# 遗留条目直接丢弃，绝不动主表中的新占位。释放占位只删主表，其索引条目
-# 留待到期弹出时惰性丢弃，因此索引可能短暂多于主表，但不影响正确性。
+# 与主表同步写入、同步删除：预留时入堆，失败释放时随主表记录一并出堆，
+# 到期时由 _sweep_nonces 从堆顶弹出。正常路径下索引条目与主表记录一一
+# 对应，索引规模随主表一同受容量约束，失败请求不会在堆中留下滞留到
+# TTL 结束的条目。索引条目同样携带占位令牌：弹出时与主表记录逐字核对，
+# 一致才删除主表项；若主表记录已被并发请求重新占用等情形改写，弹出的
+# 遗留条目直接丢弃，绝不动主表中的新占位。
 _nonce_expiry_index: list[tuple[float, int, tuple[str, str]]] = []
 
 
@@ -211,7 +213,8 @@ def _sweep_nonces(now: float) -> None:
 
     只处理到期项：按到期时间索引从堆顶依次弹出已到期条目；弹出的条目与
     主表记录（到期时间戳 + 占位令牌）逐字一致时才删除主表项，不一致即为
-    遗留条目（占位已释放或同名 nonce 已重新占用），直接丢弃。
+    遗留条目（主表记录已被并发请求重新占用等），直接丢弃，绝不动主表中
+    的新占位。
     """
     while _nonce_expiry_index and _nonce_expiry_index[0][0] <= now:
         expiry, token, nonce_key = heapq.heappop(_nonce_expiry_index)
@@ -244,17 +247,36 @@ def _reserve_nonce(
     return "reserved", reservation
 
 
+def _drop_index_entry(entry: tuple[float, int, tuple[str, str]]) -> None:
+    """从到期索引堆中移除指定条目（调用方需持有 _nonce_lock）。
+
+    条目不存在（如已被到期清理弹出）时直接忽略。定位到条目后用堆尾
+    元素覆盖空位并重建堆序；索引规模随主表受容量约束，单次移除的
+    开销有界。
+    """
+    try:
+        pos = _nonce_expiry_index.index(entry)
+    except ValueError:
+        return
+    last = _nonce_expiry_index.pop()
+    if pos < len(_nonce_expiry_index):
+        _nonce_expiry_index[pos] = last
+        heapq.heapify(_nonce_expiry_index)
+
+
 def _release_nonce(
     nonce_key: tuple[str, str], reservation: tuple[float, int]
 ) -> None:
     """释放本次失败请求自己的占位（调用方需持有 _nonce_lock）。
 
     仅当主表记录与本次预留（到期时间戳 + 占位令牌）逐字一致时才删除；
-    若该记录已过期并被并发请求重新占用，则保持不动。对应的索引条目不在
-    此处删除：它已因主表记录缺失而失效，留待到期弹出时被惰性丢弃。
+    若该记录已过期并被并发请求重新占用，则保持不动。主表记录删除的
+    同时把对应的索引条目从到期堆中移除：失效索引随释放立即回收，不会
+    滞留到 TTL 结束，索引规模不随失败次数增长。
     """
     if _nonce_seen.get(nonce_key) == reservation:
         del _nonce_seen[nonce_key]
+        _drop_index_entry((reservation[0], reservation[1], nonce_key))
 
 
 # ----------------------------- 公共类型 -----------------------------
@@ -2699,10 +2721,11 @@ def secure_request(raw: SecureRequest) -> JSONResponse:
     #    在同一把锁内完成“按到期索引清理过期项 → 识别重放 → 为新 nonce
     #    预留名额”：清理只从索引头部弹出已到期条目，不扫描未过期 nonce，
     #    且清理/判重/占位之间没有并发窗口。先占位；若后续 payload 校验或
-    #    操作执行失败则回滚，避免失败请求白白消耗 nonce（只有真正成功的
-    #    请求才永久占用）。容量对进行中占位与窗口内已成功 nonce 统一计数，
-    #    已满且无过期项时拒绝执行（503），绝不驱逐任何未过期 nonce；
-    #    409 重放优先于 503 容量不足。
+    #    操作执行失败则回滚——主表记录与到期索引条目一并删除，失效索引
+    #    立即回收，不会滞留到 TTL 结束——避免失败请求白白消耗 nonce
+    #    （只有真正成功的请求才永久占用）。容量对进行中占位与窗口内已成功
+    #    nonce 统一计数，已满且无过期项时拒绝执行（503），绝不驱逐任何
+    #    未过期 nonce；409 重放优先于 503 容量不足。
     nonce_key = (raw.key_id, raw.nonce)
     with _nonce_lock:
         status, reservation = _reserve_nonce(nonce_key, now)
@@ -2750,13 +2773,15 @@ def secure_request(raw: SecureRequest) -> JSONResponse:
             )
     except BaseException:
         # 业务异常（PlanningError/AssemblyError 等 422）或其他异常：
-        # 本次请求未成功，释放自己的 nonce 占位（记录已被并发请求重新
-        # 占用时不动），允许客户端修正后用同一 nonce 重试。
+        # 本次请求未成功，释放自己的 nonce 占位（主表记录与索引条目一并
+        # 回收；记录已被并发请求重新占用时不动），允许客户端修正后用
+        # 同一 nonce 重试。
         with _nonce_lock:
             _release_nonce(nonce_key, reservation)
         raise
 
-    # payload 校验失败（未执行任何操作）：同样回滚自己的 nonce 占位。
+    # payload 校验失败（未执行任何操作）：同样回滚自己的 nonce 占位
+    # （主表记录与索引条目一并回收）。
     if response.status_code != 200:
         with _nonce_lock:
             _release_nonce(nonce_key, reservation)

@@ -10,9 +10,11 @@
 - 过期清理由按到期时间推进的索引驱动：单次预留只从索引头部弹出已到期
   条目，不扫描未过期 nonce；
 - payload/业务失败（422）释放请求自身占位，可用同一 nonce 重试；
+- 失败释放占位时主表记录与到期索引条目一并回收：窗口内反复提交失败
+  请求不会让索引条目积压超过主表规模；
 - 释放占位时若该记录已过期并被并发请求重新占用，不能误删新记录；
-- 索引条目携带占位令牌：占位释放或同名 nonce 重新占用后，遗留的索引
-  条目弹出时不得删除主表中的新占位；
+- 索引条目携带占位令牌：同名 nonce 重新占用后，遗留的索引条目弹出时
+  不得删除主表中的新占位；
 - SECURE_REQUEST_NONCE_CAPACITY 默认 10000 且必须为正整数。
 
 直接运行：python -m unittest discover -s tests
@@ -347,33 +349,70 @@ class SecureRequestTests(unittest.TestCase):
         t0 = 30_000.0
         status, old = _reserve_nonce((KEY_ID, "idx-raced"), t0)
         self.assertEqual(status, "reserved")
-        # 失败请求释放占位：主表删除，索引条目遗留。
+        # 失败请求释放占位：主表记录与索引条目一并回收，索引立即清空。
         with _nonce_lock:
             _release_nonce((KEY_ID, "idx-raced"), old)  # type: ignore[arg-type]
             self.assertNotIn((KEY_ID, "idx-raced"), _nonce_seen)
-        # 旧索引条目尚未到期时，同名 nonce 被并发请求重新占用。
+            self.assertEqual(len(_nonce_expiry_index), 0)
+        # 同名 nonce 被并发请求重新占用。
         t1 = t0 + ttl - 1
         status, new = _reserve_nonce((KEY_ID, "idx-raced"), t1)
         self.assertEqual(status, "reserved")
         self.assertNotEqual(old, new)
-        # 旧索引条目到期弹出：令牌与主表记录不符，必须直接丢弃，
-        # 不得删除新占位。
+        # 模拟外部不同步留下的旧索引条目（如主表被直接改写）：到期弹出时
+        # 令牌与主表记录不符，必须直接丢弃，不得删除新占位。
         with _nonce_lock:
+            heapq.heappush(
+                _nonce_expiry_index, (old[0], old[1], (KEY_ID, "idx-raced"))  # type: ignore[index]
+            )
             _sweep_nonces(t0 + ttl + 0.5)  # 早于新记录的到期时间 t1+ttl
             self.assertEqual(_nonce_seen.get((KEY_ID, "idx-raced")), new)
 
-    def test_sweep_discards_index_entry_of_released_placeholder(self) -> None:
+    def test_release_reclaims_index_entry_promptly(self) -> None:
         ttl = main.secure_config.nonce_ttl
         t0 = 40_000.0
         status, reservation = _reserve_nonce((KEY_ID, "idx-released"), t0)
         self.assertEqual(status, "reserved")
         with _nonce_lock:
-            _release_nonce((KEY_ID, "idx-released"), reservation)  # type: ignore[arg-type]
-            # 释放只删主表：索引条目仍在，留待到期时惰性丢弃。
             self.assertEqual(len(_nonce_expiry_index), 1)
-            _sweep_nonces(t0 + ttl + 1)
+            _release_nonce((KEY_ID, "idx-released"), reservation)  # type: ignore[arg-type]
+            # 释放同时回收索引条目：不再滞留到 TTL 结束才惰性丢弃。
             self.assertEqual(len(_nonce_expiry_index), 0)
             self.assertNotIn((KEY_ID, "idx-released"), _nonce_seen)
+            # 之后的到期清理是空操作，不会误伤其他记录。
+            _sweep_nonces(t0 + ttl + 1)
+            self.assertEqual(len(_nonce_expiry_index), 0)
+
+    def test_failed_requests_do_not_bloat_expiry_index(self) -> None:
+        # 窗口内反复提交有效签名但 payload 非法的请求：每次失败都释放占位，
+        # 到期索引条目必须随释放一并回收，不能积压到远超容量。
+        bad_payload = dict(PLAN_PAYLOAD, object_length=-1)
+        for _ in range(4 * main.secure_config.nonce_capacity):
+            resp = self._post(self._envelope(bad_payload))
+            self.assertEqual(resp.status_code, 422)
+        with _nonce_lock:
+            self.assertEqual(len(_nonce_seen), 0)
+            self.assertEqual(len(_nonce_expiry_index), 0)
+
+        # 业务执行失败（422 unsatisfiable）同样不留下索引条目。
+        bad_business = dict(PLAN_PAYLOAD, object_length=10)
+        for _ in range(4 * main.secure_config.nonce_capacity):
+            resp = self._post(self._envelope(bad_business))
+            self.assertEqual(resp.status_code, 422)
+        with _nonce_lock:
+            self.assertEqual(len(_nonce_seen), 0)
+            self.assertEqual(len(_nonce_expiry_index), 0)
+
+        # 交织成功与失败：索引规模始终与主表一致（各 1 条成功记录）。
+        ok = self._envelope(dict(PLAN_PAYLOAD), nonce="keep-1")
+        self.assertEqual(self._post(ok).status_code, 200)
+        for _ in range(8):
+            self.assertEqual(self._post(self._envelope(bad_payload)).status_code, 422)
+        with _nonce_lock:
+            self.assertEqual(len(_nonce_seen), 1)
+            self.assertEqual(len(_nonce_expiry_index), 1)
+        # 成功记录在窗口内仍防重放。
+        self.assertEqual(self._post(ok).status_code, 409)
 
 
 class NonceCapacityConfigTests(unittest.TestCase):
